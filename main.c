@@ -1,104 +1,46 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <termios.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <string.h>
+#include "serial.h"
+#include "mq_debug.h"
 
-static struct termios oldterminfo;
-
-
-void closeserial(int fd)
+struct xenon_info
 {
-	tcsetattr(fd, TCSANOW, &oldterminfo);
-	if (close(fd) < 0)
-		perror("closeserial()");
+   int pd_id;
+   int index;
+   int info_len;
+   int dev_id_len;
+   int dev_id;
+   int send_info;
+};
+
+static void check_device(char* input_str);
+
+static unsigned char xenon_rfdb_header[4]={0x4b,0xf3,0x52,0xec};
+
+static void check_device(char* input_str)
+{
+	FILE *file = popen("ls /dev/ttyUSB*", "r");
+	fgets(input_str, 13, file);
+	pclose(file);
 }
 
-
-int openserial(char *devicename)
+int main(int argc,char* argv[])
 {
-    int fd;
-    struct termios attr;
+    int fd,ret,count=0,check_sum=0,i;
+    char serialdev[16] = {0};
+	unsigned char cmd=0x00,recv=0x00,recv_start=0;
+	struct xenon_info rfdb_info={0}; 
 
-    if ((fd = open(devicename, O_RDWR )) == -1) {
-        perror("openserial(): open()");
-        return 0;
-    }
-    if (tcgetattr(fd, &oldterminfo) == -1) {
-        perror("openserial(): tcgetattr()");
-        return 0;
-    }
-    attr = oldterminfo;
-	attr.c_cflag = CS8;
-    attr.c_cflag |= CRTSCTS | CLOCAL;
-    attr.c_oflag = 0;
-
-	attr.c_cflag = (attr.c_cflag & ~CSIZE) | CS8;     // 8-bit chars
-	// disable IGNBRK for mismatched speed tests; otherwise receive break
-	// as \000 chars
-	attr.c_iflag &= ~IGNBRK;         // disable break processing
-	attr.c_lflag = 0;                // no signaling chars, no echo,
-	                            // no canonical processing
-	attr.c_oflag = 0;                // no remapping, no delays
-	attr.c_cc[VMIN]  = 0;            // read doesn't block
-	attr.c_cc[VTIME] = 5;            // 0.5 seconds read timeout
-	attr.c_iflag &= ~(IXON | IXOFF | IXANY); // shut off xon/xoff ctrl
-	attr.c_cflag |= (CLOCAL | CREAD);// ignore modem controls,  enable reading
-	attr.c_cflag &= ~(PARENB | PARODD);      // shut off parity
-	attr.c_cflag |= 0;
-	attr.c_cflag &= ~CSTOPB;
-	attr.c_cflag &= ~CRTSCTS;
-
-
-    if (tcflush(fd, TCIOFLUSH) == -1) {
-        perror("openserial(): tcflush()");
-        return 0;
-    }
-
-	cfsetospeed(&attr,B38400);
-    cfsetispeed(&attr,B38400);            // baudrate is declarated above
-
-	if (tcsetattr(fd, TCSANOW, &attr) == -1) {
-        perror("initserial(): tcsetattr()");
-        return 0;
-    }
+	check_device(serialdev);
 	
-	return fd;
-}
-
-int setRTS(int fd, int level)
-{
-    int status;
-
-    if (ioctl(fd, TIOCMGET, &status) == -1) {
-        perror("setRTS(): TIOCMGET");
-        return 0;
-    }
-    if (level)
-        status |= TIOCM_RTS;
-    else
-        status &= ~TIOCM_RTS;
-    if (ioctl(fd, TIOCMSET, &status) == -1) {
-        perror("setRTS(): TIOCMSET");
-        return 0;
-    }
-    return 1;
-}
-
-
-int main()
-{
-    int fd,ret;
-    char *serialdev = "/dev/ttyUSB0";
-	unsigned char cmd;
-	unsigned char c;
     fd = openserial(serialdev);
     if (!fd) {
-        fprintf(stderr, "Error while initializing %s.\n", serialdev);
+        mq_debug("Error while initializing %s.\n", serialdev);
         return 1;
     }
 	
@@ -107,28 +49,102 @@ int main()
     setRTS(fd, 0);
 
 	cmd=0x00;
-	ret=write(fd,&cmd,1); // if new data is available on the serial port, print it out
-	printf("write ret=%d\n",ret);
-
-	ret=read(fd,&c,1);
-    printf("read ret=%d\n",c);
-
+	ret=write(fd,&cmd,1);
+	if(!ret)
+		return 1;
+	sleep(1);
 	cmd=0x28;
-	ret=write(fd,&cmd,1); // if new data is available on the serial port, print it out
-	printf("write ret=%d\n",ret);
-
+	ret=write(fd,&cmd,1);
+	if(!ret)
+		return 1;
 	cmd=0x04;
-	ret=write(fd,&cmd,1); // if new data is available on the serial port, print it out
-	printf("write ret=%d\n",ret);
+	ret=write(fd,&cmd,1);
+	if(!ret)
+		return 1;
 
 	for(;;)
 	{
-		ret=read(fd,&c,1);
-		printf("read ret=%d\n",c);
+		ret=read(fd,&recv,1);
+		if(recv || recv_start)
+		{
+			if(count<4)
+			{
+				if(recv!=xenon_rfdb_header[count])
+				{
+					mq_debug("header failed!!\n");
+					return 1;
+				}
+				else
+				{
+					recv_start=1;
+				}
+			}
+			else
+			{
+				if(count==4)
+				{
+					check_sum+=recv;
+					rfdb_info.pd_id=recv;
+				}
+				if(count==5)
+				{
+					check_sum+=recv;
+					rfdb_info.pd_id+=(recv<<4);
+					mq_debug("dev pd_id=%d\n",rfdb_info.pd_id);
+				}
+				if(count==6)
+				{
+					check_sum+=recv;
+					rfdb_info.index=recv;
+					mq_debug("dev index=%d\n",rfdb_info.index);
+				}
+				if(count==7)
+				{
+					check_sum+=recv;
+					rfdb_info.dev_id_len=recv>>5;
+					rfdb_info.info_len=recv&0x1f;				
+					mq_debug("dev info_len=%d\n",rfdb_info.info_len);
+					mq_debug("dev dev_id_len=%d\n",rfdb_info.dev_id_len);
+				}
+
+				if(count>7 && count<=(7+rfdb_info.dev_id_len))
+				{
+					check_sum+=recv;
+					rfdb_info.dev_id+=(recv<<(count-8)*8);
+
+					mq_debug("dev dev_id=%d\n",rfdb_info.dev_id);
+				}
+
+				if(count>(7+rfdb_info.dev_id_len) && count<=(7+rfdb_info.dev_id_len+rfdb_info.info_len))
+				{
+					check_sum+=recv;
+					rfdb_info.send_info+=(recv<<(count-(8+rfdb_info.dev_id_len))*4);
+					mq_debug("dev send_info=%d\n",rfdb_info.send_info);
+
+				}
+
+				if(count==(7+rfdb_info.dev_id_len+rfdb_info.info_len+1))
+				{
+					mq_debug("dev check_sum=%x,recv=%x\n",check_sum,recv);
+					if((check_sum&0xff)==recv)
+					{
+						count=-1;
+						recv_start=0;
+						check_sum=0;
+						rfdb_info.dev_id=rfdb_info.dev_id_len=rfdb_info.index=rfdb_info.info_len=rfdb_info.pd_id=rfdb_info.send_info=0;
+						recv=0;
+					}
+					else
+					{
+						return 1;
+					}
+				}
+				//mq_debug("read ret=%d\n",recv);
+			}
+			count+=1;
+		}
+
 	}
-
-
-
 
     closeserial(fd);
     return 0;
